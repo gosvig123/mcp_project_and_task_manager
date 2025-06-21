@@ -18,6 +18,13 @@ func (m *Manager) generateMarkdown(project Project) string {
 		content.WriteString(fmt.Sprintf("%s\n\n", project.Description))
 	}
 
+	// Add visual overview if project is complex enough
+	if m.shouldGenerateDiagram(project) {
+		content.WriteString("## Project Overview\n\n")
+		content.WriteString(m.generateMermaidDiagram(project))
+		content.WriteString("\n")
+	}
+
 	// Add task categories explanation
 	content.WriteString("## Categories\n")
 	content.WriteString("- [MVP] Core functionality tasks\n")
@@ -45,7 +52,7 @@ func (m *Manager) generateMarkdown(project Project) string {
 func (m *Manager) generateTaskMarkdown(task Task) string {
 	var content strings.Builder
 
-	// Task header with ID, category, title, and priority
+	// Task header with ID, category, title, priority, and status
 	category := string(task.Category)
 	if category == "" {
 		category = "[GENERAL]"
@@ -54,8 +61,12 @@ func (m *Manager) generateTaskMarkdown(task Task) string {
 	if priority == "" {
 		priority = "P2"
 	}
+	status := string(task.Status)
+	if status == "" {
+		status = "todo"
+	}
 
-	content.WriteString(fmt.Sprintf("## Task %d: %s %s (%s)\n\n", task.ID, category, task.Title, priority))
+	content.WriteString(fmt.Sprintf("## Task %d: %s %s (%s) [%s]\n\n", task.ID, category, task.Title, priority, status))
 
 	// Task description
 	if task.Description != "" {
@@ -158,8 +169,8 @@ func (m *Manager) parseMarkdown(content string) (*Project, error) {
 			continue
 		}
 
-		// Parse task header: ## Task 1: [MVP] Task Title (P1)
-		if taskMatch := regexp.MustCompile(`^##\s+Task\s+(\d+):\s*(\[[\w]+\])?\s*(.+?)\s*\(([^)]+)\)$`).FindStringSubmatch(line); taskMatch != nil {
+		// Parse task header: ## Task 1: [MVP] Task Title (P1) [status]
+		if taskMatch := regexp.MustCompile(`^##\s+Task\s+(\d+):\s*(\[[\w]+\])?\s*(.+?)\s*\(([^)]+)\)\s*(?:\[([^\]]+)\])?$`).FindStringSubmatch(line); taskMatch != nil {
 			// Save previous task
 			if currentTask != nil {
 				project.Tasks = append(project.Tasks, *currentTask)
@@ -175,7 +186,7 @@ func (m *Manager) parseMarkdown(content string) (*Project, error) {
 			currentTask = &Task{
 				ID:        taskID,
 				Title:     strings.TrimSpace(taskMatch[3]),
-				Status:    StatusTodo,
+				Status:    StatusTodo, // Default, will be overridden if status is present
 				Priority:  TaskPriority(taskMatch[4]),
 				CreatedAt: time.Now(),
 				UpdatedAt: time.Now(),
@@ -184,6 +195,13 @@ func (m *Manager) parseMarkdown(content string) (*Project, error) {
 			// Parse category if present
 			if taskMatch[2] != "" {
 				currentTask.Category = TaskCategory(taskMatch[2])
+			}
+
+			// Parse status if present (taskMatch[5])
+			if len(taskMatch) > 5 && taskMatch[5] != "" {
+				if status, err := ValidateTaskStatus(taskMatch[5]); err == nil {
+					currentTask.Status = status
+				}
 			}
 
 			inSubtasks = false
@@ -314,4 +332,125 @@ func (m *Manager) parseMarkdown(content string) (*Project, error) {
 	}
 
 	return project, nil
+}
+
+// shouldGenerateDiagram determines if a project is complex enough to warrant a visual diagram
+func (m *Manager) shouldGenerateDiagram(project Project) bool {
+	taskCount := len(project.Tasks)
+	subtaskCount := 0
+
+	for _, task := range project.Tasks {
+		subtaskCount += len(task.Subtasks)
+	}
+
+	// Generate diagram if:
+	// - 3+ tasks, OR
+	// - 2+ tasks with 5+ total subtasks, OR
+	// - Any tasks with dependencies
+	if taskCount >= 3 {
+		return true
+	}
+
+	if taskCount >= 2 && subtaskCount >= 5 {
+		return true
+	}
+
+	// Check for dependencies
+	for _, task := range project.Tasks {
+		if len(task.Dependencies) > 0 {
+			return true
+		}
+	}
+
+	return false
+}
+
+// generateMermaidDiagram creates a Mermaid flowchart showing project structure and progress
+func (m *Manager) generateMermaidDiagram(project Project) string {
+	var content strings.Builder
+
+	content.WriteString("```mermaid\n")
+	content.WriteString("flowchart TD\n")
+
+	// Add project node
+	content.WriteString(fmt.Sprintf("    PROJECT[\"%s\"]\n", project.Name))
+
+	// Add task nodes with status styling
+	for _, task := range project.Tasks {
+		nodeId := fmt.Sprintf("T%d", task.ID)
+
+		// Determine node style based on status and category
+		var style string
+		switch task.Status {
+		case StatusDone:
+			style = ":::completed"
+		case StatusInProgress:
+			style = ":::inprogress"
+		case StatusBlocked:
+			style = ":::blocked"
+		default:
+			style = ":::todo"
+		}
+
+		// Create node with category and title
+		category := string(task.Category)
+		if category == "" {
+			category = "[GENERAL]"
+		}
+
+		nodeLabel := fmt.Sprintf("%s\\n%s", category, task.Title)
+		content.WriteString(fmt.Sprintf("    %s[\"%s\"]%s\n", nodeId, nodeLabel, style))
+
+		// Connect project to task
+		content.WriteString(fmt.Sprintf("    PROJECT --> %s\n", nodeId))
+
+		// Add subtask nodes if any
+		if len(task.Subtasks) > 0 {
+			completedSubtasks := 0
+			for i, subtask := range task.Subtasks {
+				if subtask.Status == StatusDone {
+					completedSubtasks++
+				}
+
+				// Only show first few subtasks to avoid clutter
+				if i < 3 {
+					subtaskId := fmt.Sprintf("S%d_%d", task.ID, i)
+					subtaskStyle := ":::subtask"
+					if subtask.Status == StatusDone {
+						subtaskStyle = ":::completed"
+					}
+
+					content.WriteString(fmt.Sprintf("    %s[\"%s\"]%s\n", subtaskId, subtask.Title, subtaskStyle))
+					content.WriteString(fmt.Sprintf("    %s --> %s\n", nodeId, subtaskId))
+				}
+			}
+
+			// Add progress indicator if there are many subtasks
+			if len(task.Subtasks) > 3 {
+				progressId := fmt.Sprintf("P%d", task.ID)
+				progress := fmt.Sprintf("Progress: %d/%d", completedSubtasks, len(task.Subtasks))
+				content.WriteString(fmt.Sprintf("    %s[\"%s\"]:::progress\n", progressId, progress))
+				content.WriteString(fmt.Sprintf("    %s --> %s\n", nodeId, progressId))
+			}
+		}
+
+		// Add dependency connections
+		for _, depId := range task.Dependencies {
+			depNodeId := fmt.Sprintf("T%d", depId)
+			content.WriteString(fmt.Sprintf("    %s -.-> %s\n", depNodeId, nodeId))
+		}
+	}
+
+	// Add styling
+	content.WriteString("\n")
+	content.WriteString("    classDef completed fill:#d4edda,stroke:#155724,color:#155724\n")
+	content.WriteString("    classDef inprogress fill:#fff3cd,stroke:#856404,color:#856404\n")
+	content.WriteString("    classDef blocked fill:#f8d7da,stroke:#721c24,color:#721c24\n")
+	content.WriteString("    classDef todo fill:#e2e3e5,stroke:#383d41,color:#383d41\n")
+	content.WriteString("    classDef subtask fill:#f0f8ff,stroke:#0066cc,color:#0066cc\n")
+	content.WriteString("    classDef progress fill:#e7f3ff,stroke:#0066cc,color:#0066cc\n")
+
+	content.WriteString("```\n\n")
+
+	return content.String()
 }

@@ -110,6 +110,25 @@ type TaskFilter struct {
 	Complexity *TaskComplexity `json:"complexity,omitempty"`
 }
 
+// AttentionType represents the type of attention a task needs
+type AttentionType string
+
+const (
+	AttentionTypeCompletion AttentionType = "completion"
+	AttentionTypeStale      AttentionType = "stale"
+	AttentionTypeOverdue    AttentionType = "overdue"
+	AttentionTypeBlocked    AttentionType = "blocked"
+)
+
+// TaskAttention represents a task that needs attention
+type TaskAttention struct {
+	Task     *Task         `json:"task"`
+	Subtask  *Subtask      `json:"subtask,omitempty"`
+	Reason   string        `json:"reason"`
+	Type     AttentionType `json:"type"`
+	Severity int           `json:"severity"` // 1-5, 5 being most urgent
+}
+
 // TaskSummary provides a summary view of a task for LLM consumption
 type TaskSummary struct {
 	ID                int            `json:"id"`

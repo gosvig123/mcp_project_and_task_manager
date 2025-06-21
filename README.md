@@ -59,8 +59,8 @@ TRANSPORT=stdio
 HOST=0.0.0.0
 PORT=8050
 
-# Task storage directory
-TASKS_DIR=tasks
+# Task storage directory (relative to project root)
+TASKS_DIR=./tasks
 
 # Task management settings
 MAX_RECURSION_DEPTH=3
