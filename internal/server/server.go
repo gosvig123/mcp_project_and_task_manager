@@ -37,14 +37,36 @@ func NewTaskManagerServer() (*TaskManagerServer, error) {
 		// Auto-detect project root and use tasks subdirectory
 		projectRoot, err := detectProjectRoot()
 		if err != nil {
-			// Fall back to current working directory
-			if cwd, cwdErr := os.Getwd(); cwdErr == nil {
-				tasksDir = filepath.Join(cwd, "tasks")
+			// Fall back to a safe directory in user's home
+			if homeDir, homeErr := os.UserHomeDir(); homeErr == nil {
+				tasksDir = filepath.Join(homeDir, ".mcp-task-manager", "tasks")
 			} else {
-				tasksDir = "./tasks" // Last resort
+				// Final fallback - use temp directory
+				tasksDir = filepath.Join(os.TempDir(), "mcp-task-manager", "tasks")
 			}
 		} else {
 			tasksDir = filepath.Join(projectRoot, "tasks")
+		}
+	}
+
+	// Ensure the path is absolute and safe
+	if !filepath.IsAbs(tasksDir) {
+		// If it's still relative, make it relative to user's home directory
+		if homeDir, err := os.UserHomeDir(); err == nil {
+			tasksDir = filepath.Join(homeDir, ".mcp-task-manager", tasksDir)
+		} else {
+			// Last resort - use temp directory
+			tasksDir = filepath.Join(os.TempDir(), "mcp-task-manager", tasksDir)
+		}
+	}
+
+	// Safety check: never allow creating directories in system root or other unsafe locations
+	if tasksDir == "/" || tasksDir == "/tasks" || strings.HasPrefix(tasksDir, "/bin") || strings.HasPrefix(tasksDir, "/usr") || strings.HasPrefix(tasksDir, "/etc") {
+		// Force safe fallback
+		if homeDir, err := os.UserHomeDir(); err == nil {
+			tasksDir = filepath.Join(homeDir, ".mcp-task-manager", "tasks")
+		} else {
+			tasksDir = filepath.Join(os.TempDir(), "mcp-task-manager", "tasks")
 		}
 	}
 
@@ -307,6 +329,12 @@ func (tms *TaskManagerServer) registerTools() error {
 		),
 	)
 	tms.mcpServer.AddTool(getTasksNeedingAttentionTool, tms.handleGetTasksNeedingAttention)
+
+	// Debug info tool
+	debugInfoTool := mcp.NewTool("debug_info",
+		mcp.WithDescription("Get debug information about the task manager configuration"),
+	)
+	tms.mcpServer.AddTool(debugInfoTool, tms.handleDebugInfo)
 
 	return nil
 }
@@ -1572,10 +1600,17 @@ func optionalArray(name, desc string) mcp.ToolOption {
 
 // detectProjectRoot attempts to find the project root directory by looking for common project indicators
 func detectProjectRoot() (string, error) {
-	// Start from current working directory
-	currentDir, err := os.Getwd()
+	// Start from the directory where the binary is located
+	execPath, err := os.Executable()
 	if err != nil {
-		return "", fmt.Errorf("failed to get current directory: %w", err)
+		// Fall back to current working directory if we can't get executable path
+		currentDir, cwdErr := os.Getwd()
+		if cwdErr != nil {
+			return "", fmt.Errorf("failed to get executable path and current directory: exec=%w, cwd=%w", err, cwdErr)
+		}
+		execPath = currentDir
+	} else {
+		execPath = filepath.Dir(execPath)
 	}
 
 	// Project indicators to look for (in order of preference)
@@ -1593,7 +1628,8 @@ func detectProjectRoot() (string, error) {
 	}
 
 	// Walk up the directory tree looking for indicators
-	dir := currentDir
+	dir := execPath
+	originalDir := dir
 	for {
 		for _, indicator := range indicators {
 			indicatorPath := filepath.Join(dir, indicator)
@@ -1605,14 +1641,15 @@ func detectProjectRoot() (string, error) {
 		// Move up one directory
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			// Reached filesystem root
+			// Reached filesystem root, break to avoid infinite loop
 			break
 		}
 		dir = parent
 	}
 
-	// If no project root found, return current directory
-	return currentDir, nil
+	// If no project root found, return the original directory (where binary is located)
+	// This ensures we never return the filesystem root
+	return originalDir, nil
 }
 
 // handleAutoUpdateTasks handles the auto_update_tasks tool
@@ -1748,6 +1785,55 @@ func (tms *TaskManagerServer) handleGetTasksNeedingAttention(ctx context.Context
 	resultJSON, err := json.Marshal(result)
 	if err != nil {
 		return tms.createErrorResult("get_tasks_needing_attention", fmt.Errorf("failed to marshal result: %w", err)), nil
+	}
+
+	return tms.createSuccessResult(string(resultJSON)), nil
+}
+
+// handleDebugInfo handles the debug_info tool
+func (tms *TaskManagerServer) handleDebugInfo(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	cwd, _ := os.Getwd()
+	projectRoot, projectRootErr := detectProjectRoot()
+
+	debugInfo := map[string]interface{}{
+		"current_working_directory": cwd,
+		"tasks_directory":           tms.taskManager.GetTasksDir(),
+		"project_root_detection": map[string]interface{}{
+			"detected_root":   projectRoot,
+			"detection_error": nil,
+		},
+		"environment": map[string]interface{}{
+			"TASKS_DIR": os.Getenv("TASKS_DIR"),
+			"HOME":      os.Getenv("HOME"),
+			"USER":      os.Getenv("USER"),
+		},
+		"path_info": map[string]interface{}{
+			"tasks_dir_is_absolute": filepath.IsAbs(tms.taskManager.GetTasksDir()),
+		},
+	}
+
+	if projectRootErr != nil {
+		debugInfo["project_root_detection"].(map[string]interface{})["detection_error"] = projectRootErr.Error()
+	}
+
+	// Check if tasks directory exists and is writable
+	tasksDir := tms.taskManager.GetTasksDir()
+	if stat, err := os.Stat(tasksDir); err == nil {
+		debugInfo["tasks_directory_status"] = map[string]interface{}{
+			"exists":      true,
+			"is_dir":      stat.IsDir(),
+			"permissions": stat.Mode().String(),
+		}
+	} else {
+		debugInfo["tasks_directory_status"] = map[string]interface{}{
+			"exists": false,
+			"error":  err.Error(),
+		}
+	}
+
+	resultJSON, err := json.Marshal(debugInfo)
+	if err != nil {
+		return tms.createErrorResult("debug_info", fmt.Errorf("failed to marshal debug info: %w", err)), nil
 	}
 
 	return tms.createSuccessResult(string(resultJSON)), nil
