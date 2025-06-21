@@ -337,120 +337,115 @@ func (m *Manager) parseMarkdown(content string) (*Project, error) {
 // shouldGenerateDiagram determines if a project is complex enough to warrant a visual diagram
 func (m *Manager) shouldGenerateDiagram(project Project) bool {
 	taskCount := len(project.Tasks)
-	subtaskCount := 0
+	totalItems := 0
 
 	for _, task := range project.Tasks {
-		subtaskCount += len(task.Subtasks)
+		totalItems += 1 + len(task.Subtasks) // task + its subtasks
 	}
 
-	// Generate diagram if:
-	// - 3+ tasks, OR
-	// - 2+ tasks with 5+ total subtasks, OR
-	// - Any tasks with dependencies
-	if taskCount >= 3 {
+	// Only generate diagram for more substantial projects:
+	// - 5+ tasks, OR
+	// - 10+ total items (tasks + subtasks), OR
+	// - Complex dependency relationships
+	if taskCount >= 5 {
 		return true
 	}
 
-	if taskCount >= 2 && subtaskCount >= 5 {
+	if totalItems >= 10 {
 		return true
 	}
 
-	// Check for dependencies
+	// Check for complex dependencies (multiple tasks with dependencies)
+	tasksWithDeps := 0
 	for _, task := range project.Tasks {
 		if len(task.Dependencies) > 0 {
-			return true
+			tasksWithDeps++
 		}
+	}
+	if tasksWithDeps >= 2 {
+		return true
 	}
 
 	return false
 }
 
-// generateMermaidDiagram creates a Mermaid flowchart showing project structure and progress
+// generateMermaidDiagram creates a simple Mermaid diagram showing project progress
 func (m *Manager) generateMermaidDiagram(project Project) string {
 	var content strings.Builder
 
-	content.WriteString("```mermaid\n")
-	content.WriteString("flowchart TD\n")
+	// Calculate progress statistics
+	totalTasks := len(project.Tasks)
+	completedTasks := 0
+	inProgressTasks := 0
+	blockedTasks := 0
+	todoTasks := 0
 
-	// Add project node
-	content.WriteString(fmt.Sprintf("    PROJECT[\"%s\"]\n", project.Name))
+	totalItems := 0
+	completedItems := 0
 
-	// Add task nodes with status styling
 	for _, task := range project.Tasks {
-		nodeId := fmt.Sprintf("T%d", task.ID)
+		totalItems++ // Count the task itself
 
-		// Determine node style based on status and category
-		var style string
 		switch task.Status {
 		case StatusDone:
-			style = ":::completed"
+			completedTasks++
+			completedItems++
 		case StatusInProgress:
-			style = ":::inprogress"
+			inProgressTasks++
 		case StatusBlocked:
-			style = ":::blocked"
+			blockedTasks++
 		default:
-			style = ":::todo"
+			todoTasks++
 		}
 
-		// Create node with category and title
-		category := string(task.Category)
-		if category == "" {
-			category = "[GENERAL]"
-		}
-
-		nodeLabel := fmt.Sprintf("%s\\n%s", category, task.Title)
-		content.WriteString(fmt.Sprintf("    %s[\"%s\"]%s\n", nodeId, nodeLabel, style))
-
-		// Connect project to task
-		content.WriteString(fmt.Sprintf("    PROJECT --> %s\n", nodeId))
-
-		// Add subtask nodes if any
-		if len(task.Subtasks) > 0 {
-			completedSubtasks := 0
-			for i, subtask := range task.Subtasks {
-				if subtask.Status == StatusDone {
-					completedSubtasks++
-				}
-
-				// Only show first few subtasks to avoid clutter
-				if i < 3 {
-					subtaskId := fmt.Sprintf("S%d_%d", task.ID, i)
-					subtaskStyle := ":::subtask"
-					if subtask.Status == StatusDone {
-						subtaskStyle = ":::completed"
-					}
-
-					content.WriteString(fmt.Sprintf("    %s[\"%s\"]%s\n", subtaskId, subtask.Title, subtaskStyle))
-					content.WriteString(fmt.Sprintf("    %s --> %s\n", nodeId, subtaskId))
-				}
+		// Count subtasks
+		for _, subtask := range task.Subtasks {
+			totalItems++
+			if subtask.Status == StatusDone {
+				completedItems++
 			}
-
-			// Add progress indicator if there are many subtasks
-			if len(task.Subtasks) > 3 {
-				progressId := fmt.Sprintf("P%d", task.ID)
-				progress := fmt.Sprintf("Progress: %d/%d", completedSubtasks, len(task.Subtasks))
-				content.WriteString(fmt.Sprintf("    %s[\"%s\"]:::progress\n", progressId, progress))
-				content.WriteString(fmt.Sprintf("    %s --> %s\n", nodeId, progressId))
-			}
-		}
-
-		// Add dependency connections
-		for _, depId := range task.Dependencies {
-			depNodeId := fmt.Sprintf("T%d", depId)
-			content.WriteString(fmt.Sprintf("    %s -.-> %s\n", depNodeId, nodeId))
 		}
 	}
 
-	// Add styling
-	content.WriteString("\n")
-	content.WriteString("    classDef completed fill:#d4edda,stroke:#155724,color:#155724\n")
-	content.WriteString("    classDef inprogress fill:#fff3cd,stroke:#856404,color:#856404\n")
-	content.WriteString("    classDef blocked fill:#f8d7da,stroke:#721c24,color:#721c24\n")
-	content.WriteString("    classDef todo fill:#e2e3e5,stroke:#383d41,color:#383d41\n")
-	content.WriteString("    classDef subtask fill:#f0f8ff,stroke:#0066cc,color:#0066cc\n")
-	content.WriteString("    classDef progress fill:#e7f3ff,stroke:#0066cc,color:#0066cc\n")
+	// Use pie chart for simple progress visualization
+	content.WriteString("```mermaid\n")
+	content.WriteString("pie title Project Progress\n")
+
+	if completedItems > 0 {
+		content.WriteString(fmt.Sprintf("    \"Completed\" : %d\n", completedItems))
+	}
+
+	remainingItems := totalItems - completedItems
+	if remainingItems > 0 {
+		content.WriteString(fmt.Sprintf("    \"Remaining\" : %d\n", remainingItems))
+	}
 
 	content.WriteString("```\n\n")
+
+	// Add a simple progress table for more detail
+	content.WriteString("### Progress Summary\n\n")
+	content.WriteString("| Metric | Count | Percentage |\n")
+	content.WriteString("|--------|-------|------------|\n")
+
+	if totalTasks > 0 {
+		taskProgress := float64(completedTasks) / float64(totalTasks) * 100
+		content.WriteString(fmt.Sprintf("| Tasks Completed | %d/%d | %.1f%% |\n", completedTasks, totalTasks, taskProgress))
+	}
+
+	if totalItems > 0 {
+		itemProgress := float64(completedItems) / float64(totalItems) * 100
+		content.WriteString(fmt.Sprintf("| Overall Progress | %d/%d | %.1f%% |\n", completedItems, totalItems, itemProgress))
+	}
+
+	if inProgressTasks > 0 {
+		content.WriteString(fmt.Sprintf("| In Progress | %d | - |\n", inProgressTasks))
+	}
+
+	if blockedTasks > 0 {
+		content.WriteString(fmt.Sprintf("| Blocked | %d | - |\n", blockedTasks))
+	}
+
+	content.WriteString("\n")
 
 	return content.String()
 }

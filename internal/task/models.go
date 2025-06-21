@@ -235,6 +235,59 @@ func (p *Project) GetCompletedTaskCount() int {
 	return count
 }
 
+// GetTotalItemCount returns the total number of items (tasks + subtasks)
+func (p *Project) GetTotalItemCount() int {
+	total := len(p.Tasks)
+	for _, task := range p.Tasks {
+		total += len(task.Subtasks)
+	}
+	return total
+}
+
+// GetCompletedItemCount returns the number of completed items (tasks + subtasks)
+func (p *Project) GetCompletedItemCount() int {
+	count := 0
+	for _, task := range p.Tasks {
+		if task.IsCompleted() {
+			count++
+		}
+		for _, subtask := range task.Subtasks {
+			if subtask.Status == StatusDone {
+				count++
+			}
+		}
+	}
+	return count
+}
+
+// GetProgressPercentage returns the overall completion percentage including subtasks
+func (p *Project) GetProgressPercentage() float64 {
+	total := p.GetTotalItemCount()
+	if total == 0 {
+		return 0
+	}
+	completed := p.GetCompletedItemCount()
+	return (float64(completed) / float64(total)) * 100
+}
+
+// GetProgressSummary returns a detailed progress summary
+func (p *Project) GetProgressSummary() map[string]interface{} {
+	totalTasks := len(p.Tasks)
+	completedTasks := p.GetCompletedTaskCount()
+	totalItems := p.GetTotalItemCount()
+	completedItems := p.GetCompletedItemCount()
+
+	return map[string]interface{}{
+		"total_tasks":      totalTasks,
+		"completed_tasks":  completedTasks,
+		"total_items":      totalItems,
+		"completed_items":  completedItems,
+		"task_progress":    float64(completedTasks) / float64(totalTasks) * 100,
+		"overall_progress": p.GetProgressPercentage(),
+		"pending_choices":  p.GetPendingChoicesCount(),
+	}
+}
+
 func (p *Project) GetPendingChoicesCount() int {
 	count := 0
 	for _, task := range p.Tasks {

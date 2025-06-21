@@ -31,11 +31,21 @@ func NewTaskManagerServer() (*TaskManagerServer, error) {
 		server.WithRecovery(),
 	)
 
-	// Create task manager - default to ./tasks in project root
+	// Create task manager with robust path detection
 	tasksDir := os.Getenv("TASKS_DIR")
 	if tasksDir == "" {
-		// Use ./tasks relative to current working directory (project root)
-		tasksDir = "./tasks"
+		// Auto-detect project root and use tasks subdirectory
+		projectRoot, err := detectProjectRoot()
+		if err != nil {
+			// Fall back to current working directory
+			if cwd, cwdErr := os.Getwd(); cwdErr == nil {
+				tasksDir = filepath.Join(cwd, "tasks")
+			} else {
+				tasksDir = "./tasks" // Last resort
+			}
+		} else {
+			tasksDir = filepath.Join(projectRoot, "tasks")
+		}
 	}
 
 	taskManager, err := task.NewManager(tasksDir)
@@ -1188,16 +1198,16 @@ func (tms *TaskManagerServer) handleSuggestNextActions(ctx context.Context, requ
 	// Analyze project and generate suggestions
 	suggestions := tms.analyzeProjectAndSuggest(project, focusArea, maxSuggestions, includeBlocked)
 
+	// Get comprehensive progress summary including subtasks
+	progressSummary := project.GetProgressSummary()
+	progressSummary["suggestions_count"] = len(suggestions)
+	progressSummary["focus_area"] = focusArea
+
 	result := map[string]interface{}{
 		"project":     project.Name,
 		"focus_area":  focusArea,
 		"suggestions": suggestions,
-		"summary": map[string]interface{}{
-			"total_tasks":       len(project.Tasks),
-			"completed_tasks":   project.GetCompletedTaskCount(),
-			"pending_choices":   project.GetPendingChoicesCount(),
-			"suggestions_count": len(suggestions),
-		},
+		"summary":     progressSummary,
 	}
 
 	resultJSON, _ := json.Marshal(result)
@@ -1558,6 +1568,51 @@ func optionalString(name, desc string) mcp.ToolOption {
 
 func optionalArray(name, desc string) mcp.ToolOption {
 	return mcp.WithArray(name, mcp.Description(desc), mcp.Items(map[string]any{"type": "string"}))
+}
+
+// detectProjectRoot attempts to find the project root directory by looking for common project indicators
+func detectProjectRoot() (string, error) {
+	// Start from current working directory
+	currentDir, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("failed to get current directory: %w", err)
+	}
+
+	// Project indicators to look for (in order of preference)
+	indicators := []string{
+		".git",           // Git repository
+		"go.mod",         // Go module
+		"package.json",   // Node.js project
+		"Cargo.toml",     // Rust project
+		"pyproject.toml", // Python project
+		"pom.xml",        // Maven project
+		"build.gradle",   // Gradle project
+		"Makefile",       // Make-based project
+		"README.md",      // Generic project with README
+		".gitignore",     // Project with gitignore
+	}
+
+	// Walk up the directory tree looking for indicators
+	dir := currentDir
+	for {
+		for _, indicator := range indicators {
+			indicatorPath := filepath.Join(dir, indicator)
+			if _, err := os.Stat(indicatorPath); err == nil {
+				return dir, nil
+			}
+		}
+
+		// Move up one directory
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			// Reached filesystem root
+			break
+		}
+		dir = parent
+	}
+
+	// If no project root found, return current directory
+	return currentDir, nil
 }
 
 // handleAutoUpdateTasks handles the auto_update_tasks tool
