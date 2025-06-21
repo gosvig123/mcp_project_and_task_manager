@@ -215,21 +215,19 @@ func (tms *TaskManagerServer) registerTools() error {
 
 	// Generate task file tool
 	generateTaskFileTool := mcp.NewTool("generate_task_file",
-		mcp.WithDescription("Generate a file template based on a task's description and requirements"),
+		mcp.WithDescription("Generate a file template based on a task's description and requirements. Auto-detects project and generates smart file paths when not specified."),
 		mcp.WithString("project_name",
-			mcp.Required(),
-			mcp.Description("Name of the project"),
+			mcp.Description("Name of the project (auto-detected if not provided)"),
 		),
 		mcp.WithString("task_title",
 			mcp.Required(),
 			mcp.Description("Title of the task to generate file for"),
 		),
 		mcp.WithString("file_path",
-			mcp.Required(),
-			mcp.Description("Path where the file should be created (relative to project)"),
+			mcp.Description("Path where the file should be created (auto-generated if not provided)"),
 		),
 		mcp.WithString("file_type",
-			mcp.Description("Type of file to generate (e.g., 'go', 'js', 'py', 'md')"),
+			mcp.Description("Type of file to generate (e.g., 'go', 'js', 'py', 'md') - inferred from task if not provided"),
 		),
 		mcp.WithString("template_content",
 			mcp.Description("Optional template content provided by LLM"),
@@ -760,23 +758,36 @@ func (tms *TaskManagerServer) handleExpandTask(ctx context.Context, request mcp.
 
 // handleGenerateTaskFile handles the generate_task_file tool
 func (tms *TaskManagerServer) handleGenerateTaskFile(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	projectName, err := request.RequireString("project_name")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-
+	// Task title is required
 	taskTitle, err := request.RequireString("task_title")
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	filePath, err := request.RequireString("file_path")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+	// Project name is optional - auto-detect if not provided
+	projectName := mcp.ParseString(request, "project_name", "")
+	if projectName == "" {
+		detectedProject, err := tms.detectCurrentProject()
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to auto-detect project: %v", err)), nil
+		}
+		projectName = detectedProject
 	}
 
+	// File path is optional - auto-generate if not provided
+	filePath := mcp.ParseString(request, "file_path", "")
+
+	// File type is optional - infer if not provided
 	fileType := mcp.ParseString(request, "file_type", "")
+
 	templateContent := mcp.ParseString(request, "template_content", "")
+
+	// Ensure project exists, create if it doesn't
+	if !tms.taskManager.ProjectExists(projectName) {
+		if err := tms.taskManager.CreateProject(projectName); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("Failed to create project '%s': %v", projectName, err)), nil
+		}
+	}
 
 	// Load the project to get task details
 	project, err := tms.taskManager.LoadProject(projectName)
@@ -797,6 +808,22 @@ func (tms *TaskManagerServer) handleGenerateTaskFile(ctx context.Context, reques
 		return mcp.NewToolResultError(fmt.Sprintf("Task not found: %s", taskTitle)), nil
 	}
 
+	// Auto-detect file type if not provided
+	if fileType == "" {
+		fileType = tms.inferFileTypeFromTask(targetTask.Title, targetTask.Description)
+	}
+
+	// Auto-generate file path if not provided
+	if filePath == "" {
+		// Get project root for context
+		projectRoot, err := detectProjectRoot()
+		if err != nil {
+			// Fall back to current directory
+			projectRoot, _ = os.Getwd()
+		}
+		filePath = tms.generateSmartFilePath(targetTask.Title, targetTask.Description, fileType, projectRoot)
+	}
+
 	// Generate file content
 	var content string
 	if templateContent != "" {
@@ -807,8 +834,19 @@ func (tms *TaskManagerServer) handleGenerateTaskFile(ctx context.Context, reques
 		content = tms.generateBasicTemplate(fileType, targetTask)
 	}
 
-	// Create the file
-	fullPath := filepath.Join(projectName, filePath)
+	// Determine the full path - use project root context instead of just project name
+	var fullPath string
+	if filepath.IsAbs(filePath) {
+		fullPath = filePath
+	} else {
+		// Get project root and create file relative to it
+		projectRoot, err := detectProjectRoot()
+		if err != nil {
+			// Fall back to current directory
+			projectRoot, _ = os.Getwd()
+		}
+		fullPath = filepath.Join(projectRoot, filePath)
+	}
 
 	// Ensure directory exists
 	dir := filepath.Dir(fullPath)
@@ -821,7 +859,7 @@ func (tms *TaskManagerServer) handleGenerateTaskFile(ctx context.Context, reques
 		return mcp.NewToolResultError(fmt.Sprintf("Failed to write file: %v", err)), nil
 	}
 
-	result := fmt.Sprintf("Generated file '%s' for task '%s'", fullPath, taskTitle)
+	result := fmt.Sprintf("Generated file '%s' for task '%s' in project '%s'", fullPath, taskTitle, projectName)
 	return mcp.NewToolResultText(result), nil
 }
 
@@ -1622,6 +1660,140 @@ func optionalString(name, desc string) mcp.ToolOption {
 
 func optionalArray(name, desc string) mcp.ToolOption {
 	return mcp.WithArray(name, mcp.Description(desc), mcp.Items(map[string]any{"type": "string"}))
+}
+
+// detectCurrentProject attempts to find the most relevant project based on current context
+func (tms *TaskManagerServer) detectCurrentProject() (string, error) {
+	// First, try to find existing projects in the current working directory context
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("failed to get current working directory: %w", err)
+	}
+
+	// Get the base name of the current directory as a potential project name
+	currentDirName := filepath.Base(cwd)
+
+	// Check if a project with the current directory name exists
+	if tms.taskManager.ProjectExists(currentDirName) {
+		return currentDirName, nil
+	}
+
+	// Try to find any existing projects
+	projects, err := tms.taskManager.ListProjects()
+	if err == nil && len(projects) > 0 {
+		// Return the most recently used project (first in list)
+		return projects[0], nil
+	}
+
+	// If no existing projects, create one based on current directory
+	sanitizedName := task.SanitizeProjectName(currentDirName)
+	return sanitizedName, nil
+}
+
+// generateSmartFilePath generates an intelligent file path based on task content and project structure
+func (tms *TaskManagerServer) generateSmartFilePath(taskTitle, taskDescription, fileType string, projectRoot string) string {
+	// Sanitize the task title for use in file names
+	sanitizedTitle := strings.ToLower(taskTitle)
+	sanitizedTitle = strings.ReplaceAll(sanitizedTitle, " ", "_")
+	sanitizedTitle = strings.ReplaceAll(sanitizedTitle, "-", "_")
+	// Remove special characters
+	sanitizedTitle = strings.Map(func(r rune) rune {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' {
+			return r
+		}
+		return -1
+	}, sanitizedTitle)
+
+	// Determine appropriate subdirectory based on file type and task content
+	var subdir string
+	switch fileType {
+	case "go":
+		if strings.Contains(strings.ToLower(taskDescription), "test") {
+			subdir = "internal"
+		} else if strings.Contains(strings.ToLower(taskDescription), "cmd") || strings.Contains(strings.ToLower(taskTitle), "main") {
+			subdir = "cmd"
+		} else {
+			subdir = "internal"
+		}
+	case "js", "javascript", "ts", "typescript":
+		if strings.Contains(strings.ToLower(taskDescription), "test") {
+			subdir = "tests"
+		} else if strings.Contains(strings.ToLower(taskDescription), "component") {
+			subdir = "src/components"
+		} else {
+			subdir = "src"
+		}
+	case "py", "python":
+		if strings.Contains(strings.ToLower(taskDescription), "test") {
+			subdir = "tests"
+		} else {
+			subdir = "src"
+		}
+	case "md", "markdown":
+		if strings.Contains(strings.ToLower(taskTitle), "readme") {
+			return "README.md"
+		} else if strings.Contains(strings.ToLower(taskDescription), "doc") {
+			subdir = "docs"
+		} else {
+			subdir = ""
+		}
+	default:
+		subdir = "src"
+	}
+
+	// Generate the filename
+	filename := sanitizedTitle
+	if fileType != "" && !strings.HasSuffix(filename, "."+fileType) {
+		filename += "." + fileType
+	}
+
+	// Combine path components
+	if subdir != "" {
+		return filepath.Join(subdir, filename)
+	}
+	return filename
+}
+
+// inferFileTypeFromTask attempts to infer the file type from task content
+func (tms *TaskManagerServer) inferFileTypeFromTask(taskTitle, taskDescription string) string {
+	content := strings.ToLower(taskTitle + " " + taskDescription)
+
+	// Check for specific language indicators
+	if strings.Contains(content, "golang") || strings.Contains(content, "go ") || strings.Contains(content, ".go") {
+		return "go"
+	}
+	if strings.Contains(content, "javascript") || strings.Contains(content, "js ") || strings.Contains(content, ".js") {
+		return "js"
+	}
+	if strings.Contains(content, "typescript") || strings.Contains(content, "ts ") || strings.Contains(content, ".ts") {
+		return "ts"
+	}
+	if strings.Contains(content, "python") || strings.Contains(content, "py ") || strings.Contains(content, ".py") {
+		return "py"
+	}
+	if strings.Contains(content, "markdown") || strings.Contains(content, "documentation") || strings.Contains(content, "readme") {
+		return "md"
+	}
+	if strings.Contains(content, "html") || strings.Contains(content, "web page") {
+		return "html"
+	}
+	if strings.Contains(content, "css") || strings.Contains(content, "style") {
+		return "css"
+	}
+	if strings.Contains(content, "sql") || strings.Contains(content, "database") {
+		return "sql"
+	}
+	if strings.Contains(content, "shell") || strings.Contains(content, "bash") || strings.Contains(content, "script") {
+		return "sh"
+	}
+
+	// Default to markdown for documentation-like tasks
+	if strings.Contains(content, "document") || strings.Contains(content, "spec") || strings.Contains(content, "plan") {
+		return "md"
+	}
+
+	// Default fallback
+	return "md"
 }
 
 // detectProjectRoot attempts to find the project root directory by looking for common project indicators
