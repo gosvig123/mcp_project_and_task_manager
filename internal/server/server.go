@@ -1798,17 +1798,11 @@ func (tms *TaskManagerServer) inferFileTypeFromTask(taskTitle, taskDescription s
 
 // detectProjectRoot attempts to find the project root directory by looking for common project indicators
 func detectProjectRoot() (string, error) {
-	// Start from the directory where the binary is located
-	execPath, err := os.Executable()
+	// Start from the current working directory (where the user is working)
+	// This is crucial for MCP servers that are used from different repositories
+	currentDir, err := os.Getwd()
 	if err != nil {
-		// Fall back to current working directory if we can't get executable path
-		currentDir, cwdErr := os.Getwd()
-		if cwdErr != nil {
-			return "", fmt.Errorf("failed to get executable path and current directory: exec=%w, cwd=%w", err, cwdErr)
-		}
-		execPath = currentDir
-	} else {
-		execPath = filepath.Dir(execPath)
+		return "", fmt.Errorf("failed to get current working directory: %w", err)
 	}
 
 	// Project indicators to look for (in order of preference)
@@ -1826,7 +1820,7 @@ func detectProjectRoot() (string, error) {
 	}
 
 	// Walk up the directory tree looking for indicators
-	dir := execPath
+	dir := currentDir
 	originalDir := dir
 	for {
 		for _, indicator := range indicators {
@@ -1845,7 +1839,7 @@ func detectProjectRoot() (string, error) {
 		dir = parent
 	}
 
-	// If no project root found, return the original directory (where binary is located)
+	// If no project root found, return the current working directory
 	// This ensures we never return the filesystem root
 	return originalDir, nil
 }
