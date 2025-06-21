@@ -33,6 +33,11 @@ func (m *Manager) GetTaskFilePath(projectName string) string {
 	return filepath.Join(m.tasksDir, sanitizedName+".md")
 }
 
+// GetTasksDir returns the tasks directory path
+func (m *Manager) GetTasksDir() string {
+	return m.tasksDir
+}
+
 // ProjectExists checks if a project file exists
 func (m *Manager) ProjectExists(projectName string) bool {
 	m.mutex.RLock()
