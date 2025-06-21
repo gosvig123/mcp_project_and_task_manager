@@ -182,6 +182,18 @@ func (m *Manager) UpdateTaskStatus(projectName string, taskTitle string, subtask
 
 			if subtaskTitle == "" {
 				// Update main task status
+				if status == StatusDone {
+					// When marking a task as done, check if we should auto-complete subtasks
+					if len(project.Tasks[i].Subtasks) > 0 {
+						// Auto-complete all subtasks when main task is marked done
+						for j := range project.Tasks[i].Subtasks {
+							if project.Tasks[i].Subtasks[j].Status != StatusDone {
+								project.Tasks[i].Subtasks[j].Status = StatusDone
+								project.Tasks[i].Subtasks[j].UpdatedAt = time.Now()
+							}
+						}
+					}
+				}
 				project.Tasks[i].Status = status
 				project.Tasks[i].UpdatedAt = time.Now()
 			} else {
@@ -192,6 +204,15 @@ func (m *Manager) UpdateTaskStatus(projectName string, taskTitle string, subtask
 						project.Tasks[i].Subtasks[j].Status = status
 						project.Tasks[i].Subtasks[j].UpdatedAt = time.Now()
 						project.Tasks[i].UpdatedAt = time.Now()
+
+						// If this was the last subtask to be completed, check if main task should be auto-completed
+						if status == StatusDone && project.Tasks[i].Status != StatusDone {
+							if project.Tasks[i].CanBeMarkedComplete() {
+								project.Tasks[i].Status = StatusDone
+								project.Tasks[i].UpdatedAt = time.Now()
+							}
+						}
+
 						subtaskFound = true
 						break
 					}
@@ -221,15 +242,18 @@ func (m *Manager) GetNextTask(projectName string) (*Task, *Subtask, error) {
 
 	// Find first incomplete task/subtask
 	for _, task := range project.Tasks {
-		if task.Status != StatusDone {
+		// Use IsFullyCompleted to check both task and subtask completion
+		if !task.IsFullyCompleted() {
 			// Check for incomplete subtasks first
 			for _, subtask := range task.Subtasks {
 				if subtask.Status != StatusDone {
 					return &task, &subtask, nil
 				}
 			}
-			// If no incomplete subtasks, return the main task
-			return &task, nil, nil
+			// If no incomplete subtasks but task isn't done, return the main task
+			if task.Status != StatusDone {
+				return &task, nil, nil
+			}
 		}
 	}
 

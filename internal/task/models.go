@@ -167,6 +167,52 @@ func (t *Task) IsCompleted() bool {
 	return t.Status == StatusDone
 }
 
+// IsFullyCompleted checks if the task and all its subtasks are completed
+func (t *Task) IsFullyCompleted() bool {
+	// First check if the main task is completed
+	if t.Status != StatusDone {
+		return false
+	}
+
+	// If there are subtasks, all must be completed
+	if len(t.Subtasks) > 0 {
+		for _, subtask := range t.Subtasks {
+			if subtask.Status != StatusDone {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+// CanBeMarkedComplete checks if a task can be marked as complete
+// Returns true if task has no subtasks or all subtasks are done
+func (t *Task) CanBeMarkedComplete() bool {
+	if len(t.Subtasks) == 0 {
+		return true
+	}
+
+	for _, subtask := range t.Subtasks {
+		if subtask.Status != StatusDone {
+			return false
+		}
+	}
+	return true
+}
+
+// GetSubtaskProgress returns completion progress for subtasks
+func (t *Task) GetSubtaskProgress() (completed int, total int, percentage float64) {
+	total = len(t.Subtasks)
+	if total == 0 {
+		return 0, 0, 100.0 // No subtasks means 100% complete
+	}
+
+	completed = t.GetCompletedSubtaskCount()
+	percentage = float64(completed) / float64(total) * 100.0
+	return completed, total, percentage
+}
+
 func (t *Task) HasPendingChoices() bool {
 	for _, choice := range t.Choices {
 		if choice.ResolvedAt == nil {

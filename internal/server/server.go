@@ -509,8 +509,24 @@ func (tms *TaskManagerServer) handleUpdateTaskStatus(ctx context.Context, reques
 		return tms.createErrorResult("update_task_status", err), nil
 	}
 
+	var additionalUpdates []string
+
 	if subtaskTitle == "" {
 		// Update main task status
+		if status == task.StatusDone {
+			// When marking a task as done, check if we should auto-complete subtasks
+			if len(targetTask.Subtasks) > 0 {
+				// Auto-complete all subtasks when main task is marked done
+				for i := range targetTask.Subtasks {
+					if targetTask.Subtasks[i].Status != task.StatusDone {
+						targetTask.Subtasks[i].Status = task.StatusDone
+						targetTask.Subtasks[i].UpdatedAt = time.Now()
+						additionalUpdates = append(additionalUpdates,
+							fmt.Sprintf("Auto-completed subtask '%s'", targetTask.Subtasks[i].Title))
+					}
+				}
+			}
+		}
 		targetTask.Status = status
 		targetTask.UpdatedAt = time.Now()
 	} else {
@@ -521,6 +537,17 @@ func (tms *TaskManagerServer) handleUpdateTaskStatus(ctx context.Context, reques
 				targetTask.Subtasks[i].Status = status
 				targetTask.Subtasks[i].UpdatedAt = time.Now()
 				targetTask.UpdatedAt = time.Now()
+
+				// If this was the last subtask to be completed, check if main task should be auto-completed
+				if status == task.StatusDone && targetTask.Status != task.StatusDone {
+					if targetTask.CanBeMarkedComplete() {
+						targetTask.Status = task.StatusDone
+						targetTask.UpdatedAt = time.Now()
+						additionalUpdates = append(additionalUpdates,
+							fmt.Sprintf("Auto-completed main task '%s' (all subtasks done)", targetTask.Title))
+					}
+				}
+
 				subtaskFound = true
 				break
 			}
@@ -546,6 +573,10 @@ func (tms *TaskManagerServer) handleUpdateTaskStatus(ctx context.Context, reques
 	}
 
 	message := fmt.Sprintf("Updated %s '%s' status to %s", target, targetName, status)
+	if len(additionalUpdates) > 0 {
+		message += "\nAdditional updates:\n- " + strings.Join(additionalUpdates, "\n- ")
+	}
+
 	return tms.createSuccessResult(message), nil
 }
 
@@ -603,18 +634,13 @@ func (tms *TaskManagerServer) handleGetNextTask(ctx context.Context, request mcp
 		result["work_type"] = "main_task"
 	}
 
-	// Add progress information
-	if len(task.Subtasks) > 0 {
-		completed := 0
-		for _, st := range task.Subtasks {
-			if st.Status == "done" {
-				completed++
-			}
-		}
-		result["subtasks_total"] = len(task.Subtasks)
-		result["subtasks_completed"] = completed
-		result["progress_percent"] = (completed * 100) / len(task.Subtasks)
-	}
+	// Add progress information using enhanced methods
+	completed, total, percentage := task.GetSubtaskProgress()
+	result["subtasks_total"] = total
+	result["subtasks_completed"] = completed
+	result["progress_percent"] = int(percentage)
+	result["is_fully_completed"] = task.IsFullyCompleted()
+	result["can_be_marked_complete"] = task.CanBeMarkedComplete()
 
 	resultJSON, err := json.Marshal(result)
 	if err != nil {

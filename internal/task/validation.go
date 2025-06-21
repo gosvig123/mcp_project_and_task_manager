@@ -248,9 +248,40 @@ func AutoUpdateTaskStatuses(project *Project) ([]string, bool) {
 			updates = append(updates, subtaskUpdates...)
 			hasChanges = true
 		}
+
+		// Validate completion consistency
+		consistencyUpdates := validateCompletionConsistency(task)
+		if len(consistencyUpdates) > 0 {
+			updates = append(updates, consistencyUpdates...)
+			hasChanges = true
+		}
 	}
 
 	return updates, hasChanges
+}
+
+// validateCompletionConsistency ensures task and subtask completion states are consistent
+func validateCompletionConsistency(task *Task) []string {
+	var updates []string
+
+	// If task is marked done but has incomplete subtasks, this is inconsistent
+	if task.Status == StatusDone && len(task.Subtasks) > 0 {
+		hasIncompleteSubtasks := false
+		for i := range task.Subtasks {
+			if task.Subtasks[i].Status != StatusDone {
+				hasIncompleteSubtasks = true
+				// Auto-complete the subtask to maintain consistency
+				task.Subtasks[i].Status = StatusDone
+				task.Subtasks[i].UpdatedAt = time.Now()
+				updates = append(updates, fmt.Sprintf("Auto-completed subtask '%s' for consistency (main task was done)", task.Subtasks[i].Title))
+			}
+		}
+		if hasIncompleteSubtasks {
+			task.UpdatedAt = time.Now()
+		}
+	}
+
+	return updates
 }
 
 // autoUpdateSubtaskCompletion handles automatic subtask status updates
