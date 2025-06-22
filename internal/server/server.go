@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -17,12 +18,19 @@ import (
 
 // TaskManagerServer wraps the MCP server with task management capabilities
 type TaskManagerServer struct {
-	mcpServer   *server.MCPServer
-	taskManager *task.Manager
+	mcpServer          *server.MCPServer
+	taskManager        *task.Manager
+	autoEvalMiddleware *AutoEvaluationMiddleware
 }
 
 // NewTaskManagerServer creates a new task manager MCP server
 func NewTaskManagerServer() (*TaskManagerServer, error) {
+	// Load configuration
+	config, err := LoadServerConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load configuration: %w", err)
+	}
+
 	// Create the MCP server
 	mcpServer := server.NewMCPServer(
 		"Task Manager Go",
@@ -31,8 +39,11 @@ func NewTaskManagerServer() (*TaskManagerServer, error) {
 		server.WithRecovery(),
 	)
 
-	// Create task manager with robust path detection
-	tasksDir := os.Getenv("TASKS_DIR")
+	// Determine tasks directory
+	tasksDir := config.TasksDir
+	if tasksDir == "" {
+		tasksDir = os.Getenv("TASKS_DIR")
+	}
 	if tasksDir == "" {
 		// Auto-detect project root and use tasks subdirectory
 		projectRoot, err := detectProjectRoot()
@@ -75,9 +86,13 @@ func NewTaskManagerServer() (*TaskManagerServer, error) {
 		return nil, err
 	}
 
+	// Create auto-evaluation middleware with loaded config
+	autoEvalMiddleware := NewAutoEvaluationMiddleware(taskManager, config.AutoEvaluation)
+
 	tms := &TaskManagerServer{
-		mcpServer:   mcpServer,
-		taskManager: taskManager,
+		mcpServer:          mcpServer,
+		taskManager:        taskManager,
+		autoEvalMiddleware: autoEvalMiddleware,
 	}
 
 	// Register all tools
@@ -144,7 +159,7 @@ func (tms *TaskManagerServer) registerTools() error {
 			mcp.Description("If true, don't read existing tasks (for bulk additions)"),
 		),
 	)
-	tms.mcpServer.AddTool(addTaskTool, tms.handleAddTask)
+	tms.addTool(&addTaskTool, tms.handleAddTask)
 
 	// Update task status tool
 	updateTaskStatusTool := mcp.NewTool("update_task_status",
@@ -165,7 +180,7 @@ func (tms *TaskManagerServer) registerTools() error {
 			mcp.Enum("todo", "in_progress", "done", "blocked"),
 		),
 	)
-	tms.mcpServer.AddTool(updateTaskStatusTool, tms.handleUpdateTaskStatus)
+	tms.addTool(&updateTaskStatusTool, tms.handleUpdateTaskStatus)
 
 	// Get next task tool
 	getNextTaskTool := mcp.NewTool("get_next_task",
@@ -175,7 +190,7 @@ func (tms *TaskManagerServer) registerTools() error {
 			mcp.Description("Name of the project"),
 		),
 	)
-	tms.mcpServer.AddTool(getNextTaskTool, tms.handleGetNextTask)
+	tms.addTool(&getNextTaskTool, tms.handleGetNextTask)
 
 	// Parse PRD tool
 	parsePRDTool := mcp.NewTool("parse_prd",
@@ -300,7 +315,7 @@ func (tms *TaskManagerServer) registerTools() error {
 			mcp.Description("Include blocked tasks in analysis (default: false)"),
 		),
 	)
-	tms.mcpServer.AddTool(suggestNextActionsTool, tms.handleSuggestNextActions)
+	tms.addTool(&suggestNextActionsTool, tms.handleSuggestNextActions)
 
 	// Auto-update task statuses tool
 	autoUpdateTasksTool := mcp.NewTool("auto_update_tasks",
@@ -313,7 +328,7 @@ func (tms *TaskManagerServer) registerTools() error {
 			mcp.Description("If true, show what would be updated without making changes (default: false)"),
 		),
 	)
-	tms.mcpServer.AddTool(autoUpdateTasksTool, tms.handleAutoUpdateTasks)
+	tms.addTool(&autoUpdateTasksTool, tms.handleAutoUpdateTasks)
 
 	// Get tasks needing attention tool
 	getTasksNeedingAttentionTool := mcp.NewTool("get_tasks_needing_attention",
@@ -326,13 +341,37 @@ func (tms *TaskManagerServer) registerTools() error {
 			mcp.Description("Filter by attention type (completion, stale, overdue, blocked)"),
 		),
 	)
-	tms.mcpServer.AddTool(getTasksNeedingAttentionTool, tms.handleGetTasksNeedingAttention)
+	tms.addTool(&getTasksNeedingAttentionTool, tms.handleGetTasksNeedingAttention)
 
 	// Debug info tool
 	debugInfoTool := mcp.NewTool("debug_info",
 		mcp.WithDescription("Get debug information about the task manager configuration"),
 	)
 	tms.mcpServer.AddTool(debugInfoTool, tms.handleDebugInfo)
+
+	// Auto-evaluation config tool
+	autoEvalConfigTool := mcp.NewTool("configure_auto_evaluation",
+		mcp.WithDescription("Configure automatic task evaluation settings"),
+		mcp.WithBoolean("enabled",
+			mcp.Description("Enable or disable automatic evaluation"),
+		),
+		mcp.WithString("cache_timeout",
+			mcp.Description("Cache timeout duration (e.g., '5m', '1h')"),
+		),
+		mcp.WithNumber("max_concurrent",
+			mcp.Description("Maximum concurrent evaluations"),
+		),
+		mcp.WithBoolean("skip_read_only_tools",
+			mcp.Description("Skip evaluation for read-only tools"),
+		),
+		mcp.WithBoolean("verbose_logging",
+			mcp.Description("Enable verbose logging"),
+		),
+		mcp.WithBoolean("get_current",
+			mcp.Description("Get current configuration without changes"),
+		),
+	)
+	tms.mcpServer.AddTool(autoEvalConfigTool, tms.handleConfigureAutoEvaluation)
 
 	return nil
 }
@@ -1646,7 +1685,14 @@ func (tms *TaskManagerServer) createSuccessResult(message string) *mcp.CallToolR
 // Helper for simple tool registration - reduces boilerplate
 func (tms *TaskManagerServer) addSimpleTool(name, description string, handler func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error), params ...mcp.ToolOption) {
 	tool := mcp.NewTool(name, append([]mcp.ToolOption{mcp.WithDescription(description)}, params...)...)
-	tms.mcpServer.AddTool(tool, handler)
+	wrappedHandler := tms.autoEvalMiddleware.WrapHandler(name, handler)
+	tms.mcpServer.AddTool(tool, wrappedHandler)
+}
+
+// addTool wraps tool registration with auto-evaluation middleware
+func (tms *TaskManagerServer) addTool(tool *mcp.Tool, handler func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error)) {
+	wrappedHandler := tms.autoEvalMiddleware.WrapHandler(tool.Name, handler)
+	tms.mcpServer.AddTool(*tool, wrappedHandler)
 }
 
 // Helper for common parameter patterns
@@ -1796,8 +1842,70 @@ func (tms *TaskManagerServer) inferFileTypeFromTask(taskTitle, taskDescription s
 	return "md"
 }
 
-// detectProjectRoot attempts to find the project root directory by looking for common project indicators
+// detectProjectRoot attempts to find the project root directory using multiple strategies
 func detectProjectRoot() (string, error) {
+	// Strategy 1: Try git-based detection first (most reliable for git repos)
+	if gitRoot, err := detectGitProjectRoot(); err == nil {
+		return gitRoot, nil
+	}
+
+	// Strategy 2: Check for explicit environment variable
+	if envRoot := os.Getenv("MCP_WORKSPACE_ROOT"); envRoot != "" {
+		if filepath.IsAbs(envRoot) {
+			if _, err := os.Stat(envRoot); err == nil {
+				return envRoot, nil
+			}
+		}
+	}
+	if envRoot := os.Getenv("PROJECT_ROOT"); envRoot != "" {
+		if filepath.IsAbs(envRoot) {
+			if _, err := os.Stat(envRoot); err == nil {
+				return envRoot, nil
+			}
+		}
+	}
+
+	// Strategy 3: Use current working directory approach (existing logic)
+	return detectProjectRootByIndicators()
+}
+
+// detectGitProjectRoot uses git commands to find the repository root
+func detectGitProjectRoot() (string, error) {
+	// First try to get the current working directory for context
+	currentDir, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("failed to get current working directory: %w", err)
+	}
+
+	// Try git rev-parse --show-toplevel to get the repository root
+	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
+	cmd.Dir = currentDir
+	output, err := cmd.Output()
+	if err != nil {
+		// If that fails, try git rev-parse --show-superproject-working-tree for worktrees
+		cmd = exec.Command("git", "rev-parse", "--show-superproject-working-tree")
+		cmd.Dir = currentDir
+		output, err = cmd.Output()
+		if err != nil {
+			return "", fmt.Errorf("not in a git repository or git not available: %w", err)
+		}
+	}
+
+	gitRoot := strings.TrimSpace(string(output))
+	if gitRoot == "" {
+		return "", fmt.Errorf("git command returned empty result")
+	}
+
+	// Verify the path exists and is a directory
+	if stat, err := os.Stat(gitRoot); err != nil || !stat.IsDir() {
+		return "", fmt.Errorf("git root path is not a valid directory: %s", gitRoot)
+	}
+
+	return gitRoot, nil
+}
+
+// detectProjectRootByIndicators uses file indicators to find project root (fallback method)
+func detectProjectRootByIndicators() (string, error) {
 	// Start from the current working directory (where the user is working)
 	// This is crucial for MCP servers that are used from different repositories
 	currentDir, err := os.Getwd()
@@ -2028,5 +2136,80 @@ func (tms *TaskManagerServer) handleDebugInfo(ctx context.Context, request mcp.C
 		return tms.createErrorResult("debug_info", fmt.Errorf("failed to marshal debug info: %w", err)), nil
 	}
 
+	return tms.createSuccessResult(string(resultJSON)), nil
+}
+
+// handleConfigureAutoEvaluation handles the configure_auto_evaluation tool
+func (tms *TaskManagerServer) handleConfigureAutoEvaluation(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := request.GetArguments()
+
+	// If get_current is true, just return current configuration
+	if getCurrent, ok := args["get_current"].(bool); ok && getCurrent {
+		currentConfig := map[string]interface{}{
+			"enabled":              tms.autoEvalMiddleware.config.Enabled,
+			"cache_timeout":        tms.autoEvalMiddleware.config.CacheTimeout.String(),
+			"max_concurrent":       tms.autoEvalMiddleware.config.MaxConcurrent,
+			"skip_read_only_tools": tms.autoEvalMiddleware.config.SkipReadOnlyTools,
+			"verbose_logging":      tms.autoEvalMiddleware.config.VerboseLogging,
+		}
+
+		resultJSON, _ := json.Marshal(map[string]interface{}{
+			"current_config": currentConfig,
+			"message":        "Current auto-evaluation configuration",
+		})
+		return tms.createSuccessResult(string(resultJSON)), nil
+	}
+
+	// Update configuration based on provided parameters
+	var updates []string
+
+	if enabled, ok := args["enabled"].(bool); ok {
+		tms.autoEvalMiddleware.config.Enabled = enabled
+		updates = append(updates, fmt.Sprintf("Enabled: %v", enabled))
+	}
+
+	if cacheTimeoutStr, ok := args["cache_timeout"].(string); ok {
+		if duration, err := time.ParseDuration(cacheTimeoutStr); err == nil {
+			tms.autoEvalMiddleware.config.CacheTimeout = duration
+			updates = append(updates, fmt.Sprintf("Cache timeout: %s", duration))
+		} else {
+			return tms.createErrorResult("configure_auto_evaluation",
+				fmt.Errorf("invalid cache_timeout format: %s", cacheTimeoutStr)), nil
+		}
+	}
+
+	if maxConcurrent, ok := args["max_concurrent"].(float64); ok {
+		tms.autoEvalMiddleware.config.MaxConcurrent = int(maxConcurrent)
+		updates = append(updates, fmt.Sprintf("Max concurrent: %d", int(maxConcurrent)))
+	}
+
+	if skipReadOnly, ok := args["skip_read_only_tools"].(bool); ok {
+		tms.autoEvalMiddleware.config.SkipReadOnlyTools = skipReadOnly
+		updates = append(updates, fmt.Sprintf("Skip read-only tools: %v", skipReadOnly))
+	}
+
+	if verbose, ok := args["verbose_logging"].(bool); ok {
+		tms.autoEvalMiddleware.config.VerboseLogging = verbose
+		updates = append(updates, fmt.Sprintf("Verbose logging: %v", verbose))
+	}
+
+	if len(updates) == 0 {
+		return tms.createErrorResult("configure_auto_evaluation",
+			fmt.Errorf("no configuration parameters provided")), nil
+	}
+
+	result := map[string]interface{}{
+		"message": "Auto-evaluation configuration updated",
+		"updates": updates,
+		"current_config": map[string]interface{}{
+			"enabled":              tms.autoEvalMiddleware.config.Enabled,
+			"cache_timeout":        tms.autoEvalMiddleware.config.CacheTimeout.String(),
+			"max_concurrent":       tms.autoEvalMiddleware.config.MaxConcurrent,
+			"skip_read_only_tools": tms.autoEvalMiddleware.config.SkipReadOnlyTools,
+			"verbose_logging":      tms.autoEvalMiddleware.config.VerboseLogging,
+		},
+	}
+
+	resultJSON, _ := json.Marshal(result)
 	return tms.createSuccessResult(string(resultJSON)), nil
 }
